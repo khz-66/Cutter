@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Segment Cutter (p5.js)</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script src="jszip.min.js"></script>
+  <style>
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #e6e6e6;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    canvas {
+      display: block;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+<script>
+let sourceImage;
+let sourceBaseName = "bild";
+let imageLoaded = false;
+let croppedImages = [];
+let detectedRegions = [];
+
+// Rahmen in Quellbild-Koordinaten: { x, y, w, h }
+let cropBox = null;
+// Aktiver Griff beim Ziehen: 'n','s','e','w','nw','ne','sw','se','move' oder null
+let activeHandle = null;
+let dragLastPt = null;
+let isPointerDown = false;
+
+let detectedBgColor;
+let colorTolerance = 50.0;
+let segmentsPerWidth = 10;
+let linkNearbyPixels = true;
+const linkRadius = 2;
+
+let isExporting = false;
+let statusMessage = "Bild auswählen...";
+let showPathOverlay = false;
+let savedPathMessage = "";
+let fileInput;
+
+class ROI {
+  constructor(x, y) {
+    this.minX = x;
+    this.maxX = x;
+    this.minY = y;
+    this.maxY = y;
+  }
+
+  update(x, y) {
+    if (x < this.minX) this.minX = x;
+    if (x > this.maxX) this.maxX = x;
+    if (y < this.minY) this.minY = y;
+    if (y > this.maxY) this.maxY = y;
+  }
+
+  w() {
+    return this.maxX - this.minX + 1;
+  }
+
+  h() {
+    return this.maxY - this.minY + 1;
+  }
+}
+
+function sanitizeBaseName(filename) {
+  if (!filename || typeof filename !== "string") return "bild";
+  const withoutExt = filename.replace(/\.[^/.]+$/, "");
+  const cleaned = withoutExt
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "bild";
+}
+
+function resetCropBoxToFullImage() {
+  if (!sourceImage) {
+    cropBox = null;
+    return;
+  }
+  cropBox = {
+    x: 0,
+    y: 0,
+    w: sourceImage.width,
+    h: sourceImage.height
+  };
+}
+
+function isFullImageCropBox() {
+  if (!sourceImage || !cropBox) return true;
+  return (
+    cropBox.x === 0 &&
+    cropBox.y === 0 &&
+    cropBox.w === sourceImage.width &&
+    cropBox.h === sourceImage.height
+  );
+}
+
+function setup() {
+  const cnv = createCanvas(windowWidth, windowHeight);
+  textFont("sans-serif");
+
+  // Robuste Pointer-Events direkt auf das Canvas binden
+  const el = cnv.elt;
+  el.addEventListener("pointerdown", onPointerDown, { passive: false });
+  window.addEventListener("pointermove", onPointerMove, { passive: false });
+  window.addEventListener("pointerup", onPointerUp, { passive: false });
+  window.addEventListener("pointercancel", onPointerUp, { passive: false });
+
+  fileInput = createFileInput(handleFile);
+  fileInput.attribute("accept", "image/*");
+  fileInput.hide();
+
+  loadImage(
+    "cut.jpg",
+    (img) => {
+      sourceImage = img;
+      sourceBaseName = sanitizeBaseName("cut.jpg");
+      resetCropBoxToFullImage();
+      analyzeImageOnly();
+      imageLoaded = true;
+      statusMessage = "Ecken/Kanten ziehen, um Rahmen zu verkleinern.";
+    },
+    () => {
+      statusMessage = "cut.jpg nicht gefunden. Bild auswählen...";
+    }
+  );
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+
+function handleFile(file) {
+  if (file && file.type === "image") {
+    const chosenName = sanitizeBaseName(file.name);
+    loadImage(file.data, (img) => {
+      sourceImage = img;
+      sourceBaseName = chosenName;
+      resetCropBoxToFullImage();
+      analyzeImageOnly();
+      imageLoaded = true;
+      statusMessage = `"${file.name}" geladen. Rahmen anpassbar.`;
+    });
+  } else {
+    statusMessage = "Bitte eine gültige Bilddatei wählen.";
+  }
+}
+
+function getCanvasPoint(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top
+  };
+}
+
+function getImageDisplayRect(topH) {
+  if (!imageLoaded || !sourceImage) return null;
+
+  let imgW = width;
+  let imgH = topH;
+
+  const imageRatio = sourceImage.width / sourceImage.height;
+  const screenRatio = width / topH;
+
+  if (imageRatio > screenRatio) {
+    imgH = width / imageRatio;
+  } else {
+    imgW = topH * imageRatio;
+  }
+
+  const x = (width - imgW) / 2.0;
+  const y = (topH - imgH) / 2.0;
+
+  return { x, y, w: imgW, h: imgH };
+}
+
+function getCropBoxScreenRect(disp) {
+  if (!imageLoaded || !sourceImage || !cropBox || !disp) return null;
+  const scaleX = disp.w / sourceImage.width;
+  const scaleY = disp.h / sourceImage.height;
+  return {
+    x: disp.x + cropBox.x * scaleX,
+    y: disp.y + cropBox.y * scaleY,
+    w: cropBox.w * scaleX,
+    h: cropBox.h * scaleY
+  };
+}
+
+function hitTestCropBox(px, py, rectScreen) {
+  if (!rectScreen) return null;
+
+  const left = rectScreen.x;
+  const right = rectScreen.x + rectScreen.w;
+  const top = rectScreen.y;
+  const bottom = rectScreen.y + rectScreen.h;
+  const midX = (left + right) / 2;
+  const midY = (top + bottom) / 2;
+
+  const cornerHit = 36;
+  const edgeHit = 28;
+
+  // Zuerst Ecken prüfen
+  if (Math.hypot(px - left, py - top) <= cornerHit) return "nw";
+  if (Math.hypot(px - right, py - top) <= cornerHit) return "ne";
+  if (Math.hypot(px - left, py - bottom) <= cornerHit) return "sw";
+  if (Math.hypot(px - right, py - bottom) <= cornerHit) return "se";
+
+  // Dann Kantenmitte & Kantenbereiche
+  if (Math.hypot(px - midX, py - top) <= cornerHit || (Math.abs(py - top) <= edgeHit && px >= left && px <= right)) {
+    return "n";
+  }
+  if (Math.hypot(px - midX, py - bottom) <= cornerHit || (Math.abs(py - bottom) <= edgeHit && px >= left && px <= right)) {
+    return "s";
+  }
+  if (Math.hypot(px - left, py - midY) <= cornerHit || (Math.abs(px - left) <= edgeHit && py >= top && py <= bottom)) {
+    return "w";
+  }
+  if (Math.hypot(px - right, py - midY) <= cornerHit || (Math.abs(px - right) <= edgeHit && py >= top && py <= bottom)) {
+    return "e";
+  }
+
+  // Innerhalb des Rahmens verschieben
+  if (px > left && px < right && py > top && py < bottom) {
+    return "move";
+  }
+
+  return null;
+}
+
+function getEffectiveBounds() {
+  if (!sourceImage) return { x: 0, y: 0, w: 0, h: 0 };
+  if (!cropBox) return { x: 0, y: 0, w: sourceImage.width, h: sourceImage.height };
+  return {
+    x: constrain(Math.round(cropBox.x), 0, sourceImage.width - 1),
+    y: constrain(Math.round(cropBox.y), 0, sourceImage.height - 1),
+    w: constrain(Math.round(cropBox.w), 1, sourceImage.width),
+    h: constrain(Math.round(cropBox.h), 1, sourceImage.height)
+  };
+}
+
+function getLayoutMetrics() {
+  const topH = height * 0.62;
+  const panelY = height * 0.62;
+  const panelH = height * 0.38;
+
+  const narrow = width < 520;
+  const statusY = height * 0.655;
+  const segRowY = height * 0.725;
+  const tolRowY = narrow ? height * 0.785 : height * 0.80;
+  const optRowY = narrow ? height * 0.845 : tolRowY;
+
+  const stepBtnW = constrain(width * 0.11, 40, 76);
+  const stepBtnH = constrain(height * 0.05, 34, 56);
+
+  const ctrlAreaW = narrow ? width * 0.92 : width * 0.70;
+  const ctrlCenterX = narrow ? width * 0.5 : width * 0.38;
+  const stepOffset = min(ctrlAreaW * 0.38, 170);
+
+  const segMinus = {
+    x: ctrlCenterX - stepOffset - stepBtnW / 2,
+    y: segRowY - stepBtnH / 2,
+    w: stepBtnW,
+    h: stepBtnH
+  };
+
+  const segPlus = {
+    x: ctrlCenterX + stepOffset - stepBtnW / 2,
+    y: segRowY - stepBtnH / 2,
+    w: stepBtnW,
+    h: stepBtnH
+  };
+
+  const tolMinus = {
+    x: ctrlCenterX - stepOffset - stepBtnW / 2,
+    y: tolRowY - stepBtnH / 2,
+    w: stepBtnW,
+    h: stepBtnH
+  };
+
+  const tolPlus = {
+    x: ctrlCenterX + stepOffset - stepBtnW / 2,
+    y: tolRowY - stepBtnH / 2,
+    w: stepBtnW,
+    h: stepBtnH
+  };
+
+  const toggleW = narrow ? width * 0.34 : width * 0.19;
+  const linkBtn = {
+    x: narrow ? width * 0.13 : width * 0.76,
+    y: optRowY - stepBtnH / 2,
+    w: toggleW,
+    h: stepBtnH
+  };
+
+  const resetAreaBtn = {
+    x: narrow ? width * 0.53 : width * 0.76,
+    y: narrow ? optRowY - stepBtnH / 2 : segRowY - stepBtnH / 2,
+    w: toggleW,
+    h: stepBtnH
+  };
+
+  const btnY = height * 0.925;
+  const btnH = constrain(height * 0.064, 38, 62);
+  const gap = width * 0.03;
+  const btnW = (width * 0.92 - gap * 2) / 3;
+  const startX = width * 0.04;
+
+  const loadRect = {
+    x: startX,
+    y: btnY - btnH / 2,
+    w: btnW,
+    h: btnH
+  };
+
+  const savePngRect = {
+    x: startX + btnW + gap,
+    y: btnY - btnH / 2,
+    w: btnW,
+    h: btnH
+  };
+
+  const saveZipRect = {
+    x: startX + (btnW + gap) * 2,
+    y: btnY - btnH / 2,
+    w: btnW,
+    h: btnH
+  };
+
+  return {
+    topH,
+    panelY,
+    panelH,
+    statusY,
+    segRowY,
+    tolRowY,
+    optRowY,
+    ctrlCenterX,
+    btnY,
+    stepBtnH,
+    segMinus,
+    segPlus,
+    tolMinus,
+    tolPlus,
+    linkBtn,
+    resetAreaBtn,
+    loadRect,
+    savePngRect,
+    saveZipRect
+  };
+}
+
+function isInside(px, py, r) {
+  return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+}
+
+function draw() {
+  background(230);
+  const m = getLayoutMetrics();
+
+  // OBERER BEREICH (62%): Bild, Rahmen mit Griffen & rote Bounding-Boxes
+  if (!imageLoaded || !sourceImage) {
+    fill(80);
+    noStroke();
+    textAlign(CENTER, CENTER);
+    textSize(constrain(min(width * 0.045, height * 0.04), 18, 38));
+    text("Tippe auf 'Bild laden',\num ein Bild auszuwählen.", width / 2, m.topH * 0.5);
+  } else {
+    const disp = getImageDisplayRect(m.topH);
+    image(sourceImage, disp.x, disp.y, disp.w, disp.h);
+
+    const scaleX = disp.w / sourceImage.width;
+    const scaleY = disp.h / sourceImage.height;
+    const boxRect = getCropBoxScreenRect(disp);
+
+    if (boxRect) {
+      // Bereich außerhalb des Rahmens abdunkeln
+      fill(0, 95);
+      noStroke();
+      rect(disp.x, disp.y, disp.w, max(0, boxRect.y - disp.y));
+      rect(disp.x, boxRect.y + boxRect.h, disp.w, max(0, disp.y + disp.h - (boxRect.y + boxRect.h)));
+      rect(disp.x, boxRect.y, max(0, boxRect.x - disp.x), boxRect.h);
+      rect(boxRect.x + boxRect.w, boxRect.y, max(0, disp.x + disp.w - (boxRect.x + boxRect.w)), boxRect.h);
+
+      // Rahmenlinie
+      stroke(41, 128, 185);
+      strokeWeight(2.5);
+      noFill();
+      rect(boxRect.x, boxRect.y, boxRect.w, boxRect.h);
+
+      // Eck-Anfasser
+      const cornerSize = 18;
+      fill(255);
+      stroke(41, 128, 185);
+      strokeWeight(2.5);
+
+      const corners = [
+        [boxRect.x, boxRect.y],
+        [boxRect.x + boxRect.w, boxRect.y],
+        [boxRect.x, boxRect.y + boxRect.h],
+        [boxRect.x + boxRect.w, boxRect.y + boxRect.h]
+      ];
+      for (const [cx, cy] of corners) {
+        rect(cx - cornerSize / 2, cy - cornerSize / 2, cornerSize, cornerSize, 4);
+      }
+
+      // Kantenmitte-Anfasser
+      const midHandles = [
+        [boxRect.x + boxRect.w / 2, boxRect.y],
+        [boxRect.x + boxRect.w / 2, boxRect.y + boxRect.h],
+        [boxRect.x, boxRect.y + boxRect.h / 2],
+        [boxRect.x + boxRect.w, boxRect.y + boxRect.h / 2]
+      ];
+      fill(41, 128, 185);
+      noStroke();
+      for (const [mx, my] of midHandles) {
+        rect(mx - 7, my - 7, 14, 14, 3);
+      }
+    }
+
+    // Erkannte Segmente
+    stroke(255, 0, 0);
+    strokeWeight(2.2);
+    noFill();
+
+    for (const r of detectedRegions) {
+      rect(
+        disp.x + r.minX * scaleX,
+        disp.y + r.minY * scaleY,
+        r.w() * scaleX,
+        r.h() * scaleY
+      );
+    }
+  }
+
+  // UNTERER BEREICH (38%): Bedienfeld
+  fill(245);
+  noStroke();
+  rect(0, m.panelY, width, m.panelH);
+
+  stroke(200);
+  strokeWeight(2);
+  line(0, m.panelY, width, m.panelY);
+
+  // 1. Statuszeile
+  fill(50);
+  noStroke();
+  textAlign(CENTER, CENTER);
+  textSize(constrain(min(width * 0.031, height * 0.023), 12, 23));
+  text(statusMessage, width / 2, m.statusY);
+
+  // 2. Zeile: Größe (segmentsPerWidth)
+  noStroke();
+  fill(isPointerDown && isInside(mouseX, mouseY, m.segMinus) ? 170 : 210);
+  rect(m.segMinus.x, m.segMinus.y, m.segMinus.w, m.segMinus.h, 10);
+  fill(50);
+  textSize(constrain(m.stepBtnH * 0.55, 18, 32));
+  text("-", m.segMinus.x + m.segMinus.w / 2, m.segRowY);
+
+  fill(isPointerDown && isInside(mouseX, mouseY, m.segPlus) ? 170 : 210);
+  rect(m.segPlus.x, m.segPlus.y, m.segPlus.w, m.segPlus.h, 10);
+  fill(50);
+  text("+", m.segPlus.x + m.segPlus.w / 2, m.segRowY);
+
+  fill(30);
+  textSize(constrain(min(width * 0.028, height * 0.022), 11, 22));
+  const bounds = getEffectiveBounds();
+  const minPx = imageLoaded ? bounds.w / segmentsPerWidth : 0;
+  text(
+    `Größe: 1/${segmentsPerWidth} (${Math.round(minPx)} px)`,
+    m.ctrlCenterX,
+    m.segRowY
+  );
+
+  // 3. Zeile: Toleranz (colorTolerance)
+  fill(isPointerDown && isInside(mouseX, mouseY, m.tolMinus) ? 170 : 210);
+  rect(m.tolMinus.x, m.tolMinus.y, m.tolMinus.w, m.tolMinus.h, 10);
+  fill(50);
+  textSize(constrain(m.stepBtnH * 0.55, 18, 32));
+  text("-", m.tolMinus.x + m.tolMinus.w / 2, m.tolRowY);
+
+  fill(isPointerDown && isInside(mouseX, mouseY, m.tolPlus) ? 170 : 210);
+  rect(m.tolPlus.x, m.tolPlus.y, m.tolPlus.w, m.tolPlus.h, 10);
+  fill(50);
+  text("+", m.tolPlus.x + m.tolPlus.w / 2, m.tolRowY);
+
+  fill(30);
+  textSize(constrain(min(width * 0.028, height * 0.022), 11, 22));
+  text(`Toleranz: ${Math.round(colorTolerance)}`, m.ctrlCenterX, m.tolRowY);
+
+  // 4. Link-Schalter & Vollbild-Button
+  fill(linkNearbyPixels ? color(70, 130, 210) : 185);
+  rect(m.linkBtn.x, m.linkBtn.y, m.linkBtn.w, m.linkBtn.h, 10);
+  fill(255);
+  textSize(constrain(min(width * 0.026, height * 0.02), 11, 20));
+  text(
+    linkNearbyPixels ? "Link: AN" : "Link: AUS",
+    m.linkBtn.x + m.linkBtn.w / 2,
+    m.linkBtn.y + m.linkBtn.h / 2
+  );
+
+  const canReset = imageLoaded && !isFullImageCropBox();
+  fill(canReset ? color(230, 126, 34) : 205);
+  rect(m.resetAreaBtn.x, m.resetAreaBtn.y, m.resetAreaBtn.w, m.resetAreaBtn.h, 10);
+  fill(canReset ? 255 : 120);
+  text(
+    "Vollbild",
+    m.resetAreaBtn.x + m.resetAreaBtn.w / 2,
+    m.resetAreaBtn.y + m.resetAreaBtn.h / 2
+  );
+
+  // 5. Untere Aktions-Buttons: Bild laden | PNGs | ZIP
+  const actionFontSize = constrain(min(width * 0.03, height * 0.023), 12, 24);
+  textSize(actionFontSize);
+
+  fill(100, 150, 240);
+  rect(m.loadRect.x, m.loadRect.y, m.loadRect.w, m.loadRect.h, 12);
+  fill(255);
+  text("Bild laden", m.loadRect.x + m.loadRect.w / 2, m.btnY);
+
+  const canSave = imageLoaded && detectedRegions.length > 0 && !isExporting;
+
+  fill(canSave ? color(46, 204, 113) : 180);
+  rect(m.savePngRect.x, m.savePngRect.y, m.savePngRect.w, m.savePngRect.h, 12);
+  fill(255);
+  text(`PNGs (${detectedRegions.length})`, m.savePngRect.x + m.savePngRect.w / 2, m.btnY);
+
+  fill(canSave ? color(142, 68, 173) : 180);
+  rect(m.saveZipRect.x, m.saveZipRect.y, m.saveZipRect.w, m.saveZipRect.h, 12);
+  fill(255);
+  text(
+    isExporting ? "Packe..." : `ZIP (${detectedRegions.length})`,
+    m.saveZipRect.x + m.saveZipRect.w / 2,
+    m.btnY
+  );
+
+  // Overlay nach Export
+  if (showPathOverlay) {
+    fill(0, 180);
+    noStroke();
+    rect(0, 0, width, height);
+
+    fill(255);
+    rect(width * 0.07, height * 0.3, width * 0.86, height * 0.36, 16);
+
+    fill(30);
+    textAlign(CENTER, CENTER);
+    textSize(constrain(min(width * 0.032, height * 0.024), 13, 26));
+    text(
+      `Erfolgreich exportiert!\n\n${savedPathMessage}\n\n[ Zum Schließen tippen ]`,
+      width / 2,
+      height * 0.48
+    );
+  }
+}
+
+function onPointerDown(e) {
+  e.preventDefault();
+  isPointerDown = true;
+
+  const pt = getCanvasPoint(e);
+  const px = pt.x;
+  const py = pt.y;
+
+  if (showPathOverlay) {
+    showPathOverlay = false;
+    return;
+  }
+
+  if (isExporting) return;
+
+  const m = getLayoutMetrics();
+
+  if (isInside(px, py, m.segMinus)) {
+    if (segmentsPerWidth > 2) {
+      segmentsPerWidth--;
+      if (imageLoaded) analyzeImageOnly();
+    }
+    return;
+  }
+
+  if (isInside(px, py, m.segPlus)) {
+    if (segmentsPerWidth < 100) {
+      segmentsPerWidth++;
+      if (imageLoaded) analyzeImageOnly();
+    }
+    return;
+  }
+
+  if (isInside(px, py, m.tolMinus)) {
+    if (colorTolerance > 5) {
+      colorTolerance -= 5;
+      if (imageLoaded) analyzeImageOnly();
+    }
+    return;
+  }
+
+  if (isInside(px, py, m.tolPlus)) {
+    if (colorTolerance < 200) {
+      colorTolerance += 5;
+      if (imageLoaded) analyzeImageOnly();
+    }
+    return;
+  }
+
+  if (isInside(px, py, m.linkBtn)) {
+    linkNearbyPixels = !linkNearbyPixels;
+    if (imageLoaded) {
+      analyzeImageOnly();
+      statusMessage = `Link ${linkNearbyPixels ? "aktiviert" : "deaktiviert"} (${detectedRegions.length} Segmente).`;
+    } else {
+      statusMessage = `Link ${linkNearbyPixels ? "aktiviert" : "deaktiviert"}.`;
+    }
+    return;
+  }
+
+  if (isInside(px, py, m.resetAreaBtn) && imageLoaded && !isFullImageCropBox()) {
+    resetCropBoxToFullImage();
+    analyzeImageOnly();
+    statusMessage = `Vollbild aktiv (${detectedRegions.length} Segmente).`;
+    return;
+  }
+
+  if (isInside(px, py, m.loadRect)) {
+    openGallery();
+    return;
+  }
+
+  if (
+    imageLoaded &&
+    detectedRegions.length > 0 &&
+    isInside(px, py, m.savePngRect)
+  ) {
+    saveCroppedSegmentsAsPngs();
+    return;
+  }
+
+  if (
+    imageLoaded &&
+    detectedRegions.length > 0 &&
+    isInside(px, py, m.saveZipRect)
+  ) {
+    saveCroppedSegmentsAsZip();
+    return;
+  }
+
+  if (imageLoaded && py < m.topH) {
+    const disp = getImageDisplayRect(m.topH);
+    const boxRect = getCropBoxScreenRect(disp);
+    const hit = hitTestCropBox(px, py, boxRect);
+    if (hit) {
+      activeHandle = hit;
+      dragLastPt = { x: px, y: py };
+      statusMessage = hit === "move" ? "Rahmen verschieben..." : "Rahmengröße ändern...";
+    }
+  }
+}
+
+function onPointerMove(e) {
+  if (!activeHandle || !cropBox || !sourceImage || !dragLastPt) return;
+  e.preventDefault();
+
+  const pt = getCanvasPoint(e);
+  const m = getLayoutMetrics();
+  const disp = getImageDisplayRect(m.topH);
+  if (!disp) return;
+
+  const dxScreen = pt.x - dragLastPt.x;
+  const dyScreen = pt.y - dragLastPt.y;
+  dragLastPt = { x: pt.x, y: pt.y };
+
+  const dxImg = (dxScreen / disp.w) * sourceImage.width;
+  const dyImg = (dyScreen / disp.h) * sourceImage.height;
+
+  const minBoxSize = 20;
+  const imgW = sourceImage.width;
+  const imgH = sourceImage.height;
+
+  let left = cropBox.x;
+  let right = cropBox.x + cropBox.w;
+  let top = cropBox.y;
+  let bottom = cropBox.y + cropBox.h;
+
+  if (activeHandle === "move") {
+    const bw = right - left;
+    const bh = bottom - top;
+    left = constrain(left + dxImg, 0, imgW - bw);
+    top = constrain(top + dyImg, 0, imgH - bh);
+    right = left + bw;
+    bottom = top + bh;
+  } else {
+    if (activeHandle.includes("w")) {
+      left = constrain(left + dxImg, 0, right - minBoxSize);
+    }
+    if (activeHandle.includes("e")) {
+      right = constrain(right + dxImg, left + minBoxSize, imgW);
+    }
+    if (activeHandle.includes("n")) {
+      top = constrain(top + dyImg, 0, bottom - minBoxSize);
+    }
+    if (activeHandle.includes("s")) {
+      bottom = constrain(bottom + dyImg, top + minBoxSize, imgH);
+    }
+  }
+
+  cropBox = {
+    x: Math.round(left),
+    y: Math.round(top),
+    w: Math.max(1, Math.round(right - left)),
+    h: Math.max(1, Math.round(bottom - top))
+  };
+}
+
+function onPointerUp() {
+  isPointerDown = false;
+  if (!activeHandle) return;
+
+  activeHandle = null;
+  dragLastPt = null;
+
+  if (imageLoaded) {
+    analyzeImageOnly();
+    statusMessage = isFullImageCropBox()
+      ? `Vollbild (${detectedRegions.length} Segmente).`
+      : `Rahmen angepasst (${detectedRegions.length} Segmente).`;
+  }
+}
+
+function openGallery() {
+  fileInput.elt.click();
+}
+
+function getRgbAt(pixels, idx) {
+  const p = idx * 4;
+  return [pixels[p], pixels[p + 1], pixels[p + 2]];
+}
+
+function analyzeImageOnly() {
+  detectedRegions = [];
+  if (!sourceImage) return;
+
+  sourceImage.loadPixels();
+  const imgW = sourceImage.width;
+  const imgH = sourceImage.height;
+  const px = sourceImage.pixels;
+  const visited = new Uint8Array(imgW * imgH);
+
+  const area = getEffectiveBounds();
+  const x0 = area.x;
+  const y0 = area.y;
+  const x1 = min(imgW - 1, area.x + area.w - 1);
+  const y1 = min(imgH - 1, area.y + area.h - 1);
+
+  const [tlR, tlG, tlB] = getRgbAt(px, x0 + y0 * imgW);
+  const [trR, trG, trB] = getRgbAt(px, x1 + y0 * imgW);
+  const [blR, blG, blB] = getRgbAt(px, x0 + y1 * imgW);
+  const [brR, brG, brB] = getRgbAt(px, x1 + y1 * imgW);
+
+  const bgR = (tlR + trR + blR + brR) / 4.0;
+  const bgG = (tlG + trG + blG + brG) / 4.0;
+  const bgB = (tlB + trB + blB + brB) / 4.0;
+  detectedBgColor = color(bgR, bgG, bgB);
+
+  const minPixelSize = area.w / segmentsPerWidth;
+
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const index = x + y * imgW;
+      if (visited[index]) continue;
+
+      const [r, g, b] = getRgbAt(px, index);
+      const d = dist(r, g, b, bgR, bgG, bgB);
+
+      if (d > colorTolerance) {
+        const roi = new ROI(x, y);
+        floodFill(x, y, x0, y0, x1, y1, visited, px, roi, bgR, bgG, bgB, colorTolerance);
+
+        if (roi.w() >= minPixelSize && roi.h() >= minPixelSize) {
+          detectedRegions.push(roi);
+        }
+      }
+    }
+  }
+}
+
+function floodFill(startX, startY, x0, y0, x1, y1, visited, px, roi, bgR, bgG, bgB, tolerance) {
+  const imgW = sourceImage.width;
+
+  const queueX = [startX];
+  const queueY = [startY];
+  let head = 0;
+
+  visited[startX + startY * imgW] = 1;
+
+  const radius = linkNearbyPixels ? linkRadius : 1;
+
+  while (head < queueX.length) {
+    const cx = queueX[head];
+    const cy = queueY[head];
+    head++;
+
+    roi.update(cx, cy);
+
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        if (!linkNearbyPixels && Math.abs(dx) + Math.abs(dy) > 1) continue;
+
+        const nx = cx + dx;
+        const ny = cy + dy;
+
+        if (nx >= x0 && nx <= x1 && ny >= y0 && ny <= y1) {
+          const nIndex = nx + ny * imgW;
+          if (!visited[nIndex]) {
+            const [nr, ng, nb] = getRgbAt(px, nIndex);
+            const d = dist(nr, ng, nb, bgR, bgG, bgB);
+
+            if (d > tolerance) {
+              visited[nIndex] = 1;
+              queueX.push(nx);
+              queueY.push(ny);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function saveCroppedSegmentsAsPngs() {
+  croppedImages = [];
+  const area = getEffectiveBounds();
+  const maxX = area.x + area.w;
+  const maxY = area.y + area.h;
+
+  let counter = 1;
+  for (const r of detectedRegions) {
+    const x = max(area.x, r.minX - 5);
+    const y = max(area.y, r.minY - 5);
+    const cw = min(maxX - x, r.w() + 10);
+    const ch = min(maxY - y, r.h() + 10);
+
+    const crop = sourceImage.get(x, y, cw, ch);
+    croppedImages.push(crop);
+
+    const filename = `${sourceBaseName}_cut_${nf(counter++, 4)}`;
+    crop.save(filename, "png");
+  }
+
+  savedPathMessage =
+    `Dateien wie "${sourceBaseName}_cut_0001.png" wurden über den Downloadordner gespeichert.`;
+  showPathOverlay = true;
+  statusMessage = `${detectedRegions.length} PNGs gespeichert!`;
+}
+
+function p5ImageToBase64Png(img) {
+  const tempCanvas = document.createElement("canvas");
+  tempCanvas.width = img.width;
+  tempCanvas.height = img.height;
+  const ctx = tempCanvas.getContext("2d");
+
+  img.loadPixels();
+  const imageData = ctx.createImageData(img.width, img.height);
+  imageData.data.set(img.pixels);
+  ctx.putImageData(imageData, 0, 0);
+
+  const dataUrl = tempCanvas.toDataURL("image/png");
+  return dataUrl.split(",")[1];
+}
+
+async function saveCroppedSegmentsAsZip() {
+  if (typeof JSZip === "undefined") {
+    statusMessage = "JSZip konnte nicht geladen werden.";
+    return;
+  }
+
+  isExporting = true;
+  statusMessage = `Erstelle ZIP mit ${detectedRegions.length} Segmenten...`;
+  croppedImages = [];
+
+  try {
+    const zip = new JSZip();
+    const area = getEffectiveBounds();
+    const maxX = area.x + area.w;
+    const maxY = area.y + area.h;
+
+    let counter = 1;
+    for (const r of detectedRegions) {
+      const x = max(area.x, r.minX - 5);
+      const y = max(area.y, r.minY - 5);
+      const cw = min(maxX - x, r.w() + 10);
+      const ch = min(maxY - y, r.h() + 10);
+
+      const crop = sourceImage.get(x, y, cw, ch);
+      croppedImages.push(crop);
+
+      const base64Png = p5ImageToBase64Png(crop);
+      const filename = `${sourceBaseName}_cut_${nf(counter++, 4)}.png`;
+      zip.file(filename, base64Png, { base64: true });
+    }
+
+    const zipName = `${sourceBaseName}_cuts.zip`;
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = zipName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    savedPathMessage = `${detectedRegions.length} PNGs (${sourceBaseName}_cut_0001.png ...) als "${zipName}" heruntergeladen.`;
+    showPathOverlay = true;
+    statusMessage = `${detectedRegions.length} Segmente in ${zipName} gespeichert!`;
+  } catch (err) {
+    console.error(err);
+    statusMessage = "Fehler beim Erstellen der ZIP-Datei!";
+  } finally {
+    isExporting = false;
+  }
+}
+</script>
+</body>
+</html>
