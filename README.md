@@ -1,6 +1,6 @@
 Cutter erkennt Motive oder Elemente aus Bildern automatisch, grenzt sie auf einen gewählten Bereich ein und speichert sie als einzelne PNG-Dateien oder gebündelt als ZIP-Archiv ins Download-Verzeichnis.
 
-
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-DFFF00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/khz66)
 
 Die Browserbasierte Web-App Cutter ermittelt die Hintergrundfarbe automatisch aus den Ecken des aktiven Bereichs, markiert erkannte Segmente mit roten Rahmen und lässt Mindestgröße, Farbtoleranz sowie Pixel-Verknüpfung live nachjustieren.
 
